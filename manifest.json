@@ -1,0 +1,32 @@
+{
+  "name": "WaitTalk",
+  "short_name": "WaitTalk",
+  "description": "Praat met wie naast je staat",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f4f0",
+  "theme_color": "#1D9E75",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "screenshots/home.png",
+      "sizes": "390x844",
+      "type": "image/png",
+      "form_factor": "narrow"
+    }
+  ]
+}

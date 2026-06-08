@@ -3,600 +3,631 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>WaitTalk – UX Prototype</title>
+  <meta name="theme-color" content="#1D9E75" />
+  <meta name="description" content="WaitTalk – Praat met wie naast je staat" />
+  <title>WaitTalk</title>
+
+  <!-- PWA manifest -->
+  <link rel="manifest" href="manifest.json" />
+
+  <!-- Icons -->
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+
+  <!-- Tabler icons -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css" />
+
+  <!-- Firebase SDK (v10 modular via CDN) -->
+  <script type="module">
+    import { initializeApp }          from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+    import { getAuth, signInAnonymously, onAuthStateChanged }
+                                      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+    import { getDatabase, ref, set, onValue, remove, serverTimestamp }
+                                      from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+    // ─────────────────────────────────────────────────────────
+    // 🔧 STAP 1: Vervang dit met jouw eigen Firebase config
+    //    Ga naar: https://console.firebase.google.com
+    //    → Nieuw project → Voeg web-app toe → Kopieer config hier
+    // ─────────────────────────────────────────────────────────
+    const firebaseConfig = {
+      apiKey:            "JOUW_API_KEY",
+      authDomain:        "JOUW_PROJECT.firebaseapp.com",
+      databaseURL:       "https://JOUW_PROJECT-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId:         "JOUW_PROJECT",
+      storageBucket:     "JOUW_PROJECT.appspot.com",
+      messagingSenderId: "JOUW_SENDER_ID",
+      appId:             "JOUW_APP_ID"
+    };
+
+    const app  = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const db   = getDatabase(app);
+
+    // ── Globale state ──────────────────────────────────────
+    let currentUser  = null;
+    let activeRef    = null;   // verwijzing naar eigen actieve-gebruiker node
+    let matchWatcher = null;   // listener die matches binnenhaalt
+
+    // ── App opstarten zodra DOM klaar is ──────────────────
+    window.addEventListener("DOMContentLoaded", () => {
+      loadProfile();
+
+      onAuthStateChanged(auth, user => {
+        if (user) {
+          currentUser = user;
+          console.log("Ingelogd als:", user.uid);
+          showScreen("home");
+        } else {
+          signInAnonymously(auth).catch(err => showError("Inloggen mislukt: " + err.message));
+        }
+      });
+
+      // Knoppen koppelen
+      document.getElementById("btn-save-profile").addEventListener("click",  saveProfile);
+      document.getElementById("btn-start-waiting").addEventListener("click", startWaiting);
+      document.getElementById("btn-stop-waiting").addEventListener("click",  stopWaiting);
+      document.getElementById("btn-accept-match").addEventListener("click",  acceptMatch);
+      document.getElementById("btn-decline-match").addEventListener("click", declineMatch);
+      document.getElementById("btn-done").addEventListener("click",          finishChat);
+      document.getElementById("btn-edit-profile").addEventListener("click",  () => showScreen("profile"));
+
+      // Topic chips
+      document.querySelectorAll(".topic-chip").forEach(chip => {
+        chip.addEventListener("click", () => chip.classList.toggle("sel"));
+      });
+    });
+
+    // ── Profiel opslaan / laden (localStorage) ────────────
+    function saveProfile() {
+      const name = document.getElementById("input-name").value.trim();
+      if (!name) { showError("Voer een naam in"); return; }
+
+      const selected = [...document.querySelectorAll(".topic-chip.sel")]
+        .map(c => c.dataset.topic);
+      if (selected.length === 0) { showError("Kies minstens één onderwerp"); return; }
+
+      const profile = { name, topics: selected };
+      localStorage.setItem("wt_profile", JSON.stringify(profile));
+      showScreen("home");
+      renderHome(profile);
+    }
+
+    function loadProfile() {
+      const raw = localStorage.getItem("wt_profile");
+      if (!raw) { showScreen("profile"); return; }
+      const profile = JSON.parse(raw);
+
+      // Naam invullen
+      document.getElementById("input-name").value = profile.name;
+
+      // Chips activeren
+      document.querySelectorAll(".topic-chip").forEach(chip => {
+        chip.classList.toggle("sel", profile.topics.includes(chip.dataset.topic));
+      });
+
+      renderHome(profile);
+      showScreen("home");
+    }
+
+    function getProfile() {
+      const raw = localStorage.getItem("wt_profile");
+      return raw ? JSON.parse(raw) : null;
+    }
+
+    function renderHome(profile) {
+      document.getElementById("home-greeting").textContent = "Hoi " + profile.name;
+      const tagsEl = document.getElementById("home-tags");
+      tagsEl.innerHTML = profile.topics
+        .map(t => `<span class="my-tag">${t}</span>`).join("");
+    }
+
+    // ── Wachtstand ────────────────────────────────────────
+    async function startWaiting() {
+      if (!currentUser) return;
+      const profile = getProfile();
+      if (!profile) { showScreen("profile"); return; }
+
+      setWaitingUI(true);
+
+      // Schrijf jezelf in de 'active_users' lijst in Firebase
+      activeRef = ref(db, "active_users/" + currentUser.uid);
+      await set(activeRef, {
+        name:      profile.name,
+        topics:    profile.topics,
+        timestamp: serverTimestamp(),
+        matched:   false
+      });
+
+      // Luister of er een match binnenkomt
+      matchWatcher = onValue(activeRef, snapshot => {
+        const data = snapshot.val();
+        if (data && data.matched && data.matchedWith) {
+          showMatchScreen(data.matchedWith);
+        }
+      });
+
+      // Zoek zelf ook actief naar matches
+      findMatch(profile);
+    }
+
+    async function stopWaiting() {
+      setWaitingUI(false);
+      if (matchWatcher) { matchWatcher(); matchWatcher = null; }
+      if (activeRef)    { await remove(activeRef); activeRef = null; }
+    }
+
+    function setWaitingUI(active) {
+      document.getElementById("btn-start-waiting").style.display = active ? "none" : "flex";
+      document.getElementById("btn-stop-waiting").style.display  = active ? "flex" : "none";
+      document.getElementById("wait-status").textContent =
+        active ? "We zoeken iemand dichtbij..." : "Tik om te starten";
+      document.getElementById("wait-status").className =
+        "wait-hint" + (active ? " searching" : "");
+    }
+
+    // ── Match zoeken ──────────────────────────────────────
+    function findMatch(ownProfile) {
+      const usersRef = ref(db, "active_users");
+      onValue(usersRef, snapshot => {
+        const all = snapshot.val();
+        if (!all) return;
+
+        for (const [uid, data] of Object.entries(all)) {
+          if (uid === currentUser.uid) continue;  // sla jezelf over
+          if (data.matched) continue;              // al gematcht
+
+          const overlap = ownProfile.topics.filter(t => data.topics?.includes(t));
+          if (overlap.length > 0) {
+            proposeMatch(uid, data, overlap[0]);
+            break;  // stop na eerste match
+          }
+        }
+      }, { onlyOnce: true });
+    }
+
+    async function proposeMatch(theirUid, theirData, sharedTopic) {
+      if (!activeRef) return;
+      const profile = getProfile();
+
+      // Schrijf match naar beide gebruikers
+      await set(ref(db, "active_users/" + currentUser.uid), {
+        name:        profile.name,
+        topics:      profile.topics,
+        timestamp:   serverTimestamp(),
+        matched:     true,
+        matchedWith: { uid: theirUid, name: theirData.name, topic: sharedTopic }
+      });
+      await set(ref(db, "active_users/" + theirUid + "/matched"), true);
+      await set(ref(db, "active_users/" + theirUid + "/matchedWith"), {
+        uid:   currentUser.uid,
+        name:  profile.name,
+        topic: sharedTopic
+      });
+    }
+
+    // ── Match scherm ──────────────────────────────────────
+    function showMatchScreen(matchData) {
+      document.getElementById("match-name").textContent  = matchData.name;
+      document.getElementById("match-topic").textContent = matchData.topic;
+      document.getElementById("match-starter").textContent =
+        starters[matchData.topic] || "Wat vind jij er van?";
+
+      const myInitials = getProfile()?.name?.slice(0,2).toUpperCase() || "JJ";
+      const theirInit  = matchData.name.slice(0,2).toUpperCase();
+      document.getElementById("av-you").textContent  = myInitials;
+      document.getElementById("av-them").textContent = theirInit;
+
+      stopWaiting();
+      showScreen("match");
+    }
+
+    function acceptMatch() {
+      const topic = document.getElementById("match-topic").textContent;
+      const name  = document.getElementById("match-name").textContent;
+      document.getElementById("connect-name").textContent  = name;
+      document.getElementById("connect-topic").textContent = topic;
+      document.getElementById("connect-starter").textContent =
+        document.getElementById("match-starter").textContent;
+      showScreen("connect");
+    }
+
+    function declineMatch() {
+      showScreen("home");
+    }
+
+    function finishChat() {
+      showScreen("home");
+    }
+
+    // ── Hulpfuncties ──────────────────────────────────────
+    function showScreen(id) {
+      document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+      document.getElementById("screen-" + id).classList.add("active");
+    }
+
+    function showError(msg) {
+      const el = document.getElementById("error-toast");
+      el.textContent = msg;
+      el.classList.add("visible");
+      setTimeout(() => el.classList.remove("visible"), 3000);
+    }
+
+    // Gespreksopeners per onderwerp
+    const starters = {
+      "Voetbal":       "Welk team volg jij al het langst?",
+      "Tech":          "Wat vind jij van AI in het dagelijks leven?",
+      "Muziek":        "Wat was het laatste concert dat je bezocht?",
+      "Reizen":        "Wat is de mooiste plek die je ooit bezocht?",
+      "Koken":         "Wat is jouw signature gerecht?",
+      "Boeken":        "Wat lees je nu en zou je het aanraden?",
+      "Werk":          "Waar doe jij energie van in je werk?",
+      "Films":         "Welke film heeft jou het meest verrast?",
+      "Sport":         "Hoe ben jij begonnen met sporten?",
+      "Nieuws":        "Wat volg jij het liefst in het nieuws?",
+      "Duurzaamheid":  "Wat doe jij zelf al voor het klimaat?",
+      "Kunst":         "Welk kunstwerk heeft jou echt geraakt?"
+    };
+  </script>
+
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg: #f5f4f0;
-      --surface: #ffffff;
-      --surface2: #f1f0ec;
-      --border: rgba(0,0,0,0.12);
-      --border2: rgba(0,0,0,0.22);
-      --text: #1a1a18;
-      --text2: #6b6a65;
-      --text3: #a09f9a;
-      --teal: #1D9E75;
-      --teal-light: #E1F5EE;
-      --teal-mid: #5DCAA5;
-      --teal-dark: #0F6E56;
-      --teal-deep: #085041;
-      --blue-light: #E6F1FB;
-      --blue: #185FA5;
-      --amber-light: #FAEEDA;
-      --amber: #854F0B;
-      --radius-md: 8px;
-      --radius-lg: 14px;
-      --radius-xl: 20px;
+      --bg:          #f5f4f0;
+      --surface:     #ffffff;
+      --surface2:    #f0efeb;
+      --border:      rgba(0,0,0,0.11);
+      --border2:     rgba(0,0,0,0.20);
+      --text:        #1a1a18;
+      --text2:       #6b6a65;
+      --text3:       #a09f9a;
+      --teal:        #1D9E75;
+      --teal-l:      #E1F5EE;
+      --teal-m:      #5DCAA5;
+      --teal-d:      #0F6E56;
+      --teal-dd:     #085041;
+      --blue-l:      #E6F1FB;
+      --blue:        #185FA5;
+      --amber-l:     #FAEEDA;
+      --amber:       #854F0B;
+      --r:           8px;
+      --rl:          14px;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg:       #181816;
+        --surface:  #242422;
+        --surface2: #2c2c2a;
+        --border:   rgba(255,255,255,0.09);
+        --border2:  rgba(255,255,255,0.18);
+        --text:     #eeede7;
+        --text2:    #9c9a92;
+        --text3:    #68675f;
+      }
     }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
-      min-height: 100vh;
+      min-height: 100svh;
       display: flex;
       flex-direction: column;
       align-items: center;
-      padding: 32px 16px 48px;
-      gap: 0;
+      padding: 0;
     }
 
-    /* ---- Top header ---- */
-    .app-header {
+    /* ── App shell ── */
+    .app-bar {
       width: 100%;
-      max-width: 420px;
+      max-width: 480px;
+      padding: 14px 20px 10px;
       display: flex;
       align-items: center;
       gap: 10px;
-      margin-bottom: 24px;
+      position: sticky;
+      top: 0;
+      background: var(--bg);
+      z-index: 10;
+      border-bottom: 0.5px solid var(--border);
     }
-    .app-logo {
-      width: 36px; height: 36px;
+    .logo {
+      width: 32px; height: 32px;
       background: var(--teal);
-      border-radius: 10px;
+      border-radius: 9px;
       display: flex; align-items: center; justify-content: center;
     }
-    .app-logo i { font-size: 20px; color: #fff; }
-    .app-name { font-size: 20px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
-    .app-tag { font-size: 12px; color: var(--text2); margin-top: 1px; }
-    .proto-badge {
-      margin-left: auto;
-      font-size: 10px; font-weight: 600;
-      padding: 3px 8px;
-      background: var(--teal-light);
-      color: var(--teal-dark);
-      border-radius: 20px;
-      border: 0.5px solid var(--teal-mid);
-      text-transform: uppercase; letter-spacing: 0.06em;
+    .logo i { font-size: 18px; color: #fff; }
+    .app-title { font-size: 18px; font-weight: 700; color: var(--text); letter-spacing: -0.02em; }
+    .app-bar-actions { margin-left: auto; }
+    .icon-btn {
+      background: none; border: none;
+      color: var(--text2); font-size: 20px;
+      cursor: pointer; padding: 4px;
+      border-radius: var(--r);
     }
+    .icon-btn:hover { color: var(--text); }
 
-    /* ---- Nav tabs ---- */
-    .nav-tabs {
-      display: flex;
-      gap: 6px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-      justify-content: center;
-      width: 100%;
-      max-width: 420px;
-    }
-    .tab-btn {
-      font-size: 12px;
-      padding: 6px 14px;
-      border-radius: 20px;
-      border: 0.5px solid var(--border2);
-      background: var(--surface);
-      color: var(--text2);
-      cursor: pointer;
-      transition: all 0.15s;
-      font-family: inherit;
-    }
-    .tab-btn:hover { background: var(--surface2); }
-    .tab-btn.active {
-      background: var(--teal);
-      color: #fff;
-      border-color: var(--teal);
-    }
-
-    /* ---- Phone frame ---- */
-    .phone {
-      width: 320px;
-      min-height: 580px;
-      background: var(--surface);
-      border-radius: 40px;
-      border: 1px solid var(--border2);
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-      position: relative;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.10);
-    }
-    .phone-notch {
-      width: 90px; height: 12px;
-      background: var(--border);
-      border-radius: 0 0 10px 10px;
-      align-self: center;
-      flex-shrink: 0;
-      margin-bottom: 4px;
-    }
-
-    .screen { display: none; flex-direction: column; flex: 1; padding: 18px 18px 20px; }
+    /* ── Schermen ── */
+    .screen { display: none; flex-direction: column; width: 100%; max-width: 480px; padding: 20px; gap: 16px; }
     .screen.active { display: flex; }
 
-    /* ---- SCREEN 1: Profiel ---- */
-    .onboard-icon {
-      width: 60px; height: 60px;
-      background: var(--teal-light);
-      border-radius: 18px;
-      display: flex; align-items: center; justify-content: center;
-      margin: 12px auto 14px;
-    }
-    .onboard-icon i { font-size: 30px; color: var(--teal); }
-    .onboard-title { font-size: 22px; font-weight: 600; color: var(--text); text-align: center; margin-bottom: 6px; }
-    .onboard-sub { font-size: 13px; color: var(--text2); text-align: center; line-height: 1.55; margin-bottom: 20px; padding: 0 10px; }
-
-    .field-label { font-size: 11px; font-weight: 600; color: var(--text2); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.05em; }
-    .fake-input {
+    /* ── Profiel ── */
+    .section-title { font-size: 11px; font-weight: 700; color: var(--text2); text-transform: uppercase; letter-spacing: 0.07em; }
+    .field-label { font-size: 13px; color: var(--text2); margin-bottom: 5px; }
+    input[type="text"] {
+      width: 100%;
+      padding: 11px 14px;
       border: 0.5px solid var(--border2);
-      border-radius: var(--radius-md);
-      padding: 10px 13px;
-      font-size: 14px;
+      border-radius: var(--r);
+      font-size: 15px;
+      background: var(--surface);
       color: var(--text);
-      background: var(--surface2);
-      margin-bottom: 16px;
+      font-family: inherit;
+      outline: none;
     }
+    input[type="text"]:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(29,158,117,0.15); }
 
-    .topics-grid { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 20px; }
+    .topics-grid { display: flex; flex-wrap: wrap; gap: 8px; }
     .topic-chip {
-      padding: 7px 13px;
+      padding: 7px 14px;
       border-radius: 20px;
-      font-size: 12px; font-weight: 500;
+      font-size: 13px; font-weight: 500;
       border: 0.5px solid var(--border2);
-      background: var(--surface2);
+      background: var(--surface);
       color: var(--text2);
       cursor: pointer;
       transition: all 0.15s;
       user-select: none;
     }
-    .topic-chip:hover { border-color: var(--teal-mid); }
-    .topic-chip.sel {
-      background: var(--teal-light);
-      border-color: var(--teal-mid);
-      color: var(--teal-dark);
-    }
+    .topic-chip:hover { border-color: var(--teal-m); }
+    .topic-chip.sel { background: var(--teal-l); border-color: var(--teal-m); color: var(--teal-d); }
 
-    .btn-primary {
-      width: 100%;
-      padding: 13px;
-      background: var(--teal);
-      color: #fff;
-      border: none;
-      border-radius: var(--radius-md);
-      font-size: 14px; font-weight: 600;
-      cursor: pointer;
-      font-family: inherit;
-      margin-top: auto;
-      transition: opacity 0.15s;
-      letter-spacing: -0.01em;
+    /* ── Home ── */
+    .greeting { font-size: 22px; font-weight: 700; color: var(--text); letter-spacing: -0.02em; }
+    .my-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+    .my-tag {
+      font-size: 12px; padding: 5px 12px;
+      border-radius: 20px;
+      background: var(--teal-l); color: var(--teal-d);
+      border: 0.5px solid var(--teal-m);
     }
-    .btn-primary:hover { opacity: 0.9; }
-    .btn-primary:active { opacity: 0.8; transform: scale(0.99); }
-
-    /* ---- SCREEN 2: Wachtstand ---- */
-    .wait-header {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 4px;
-    }
-    .greeting { font-size: 17px; font-weight: 600; color: var(--text); }
-    .status-row { display: flex; align-items: center; gap: 5px; }
-    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text3); }
-    .status-dot.active { background: var(--teal); }
-    .status-txt { font-size: 11px; color: var(--text2); }
 
     .wait-card {
-      background: var(--surface2);
-      border-radius: var(--radius-lg);
+      background: var(--surface);
       border: 0.5px solid var(--border);
-      padding: 22px 16px;
-      margin: 14px 0;
-      display: flex; flex-direction: column; align-items: center;
-      gap: 12px;
+      border-radius: var(--rl);
+      padding: 28px 20px;
+      display: flex; flex-direction: column;
+      align-items: center; gap: 16px;
     }
-    .wait-hint { font-size: 12px; color: var(--text2); text-align: center; }
+    .wait-hint {
+      font-size: 13px; color: var(--text2); text-align: center;
+      transition: color 0.3s;
+    }
+    .wait-hint.searching { color: var(--teal); }
 
     .big-btn {
-      width: 106px; height: 106px; border-radius: 50%;
+      width: 110px; height: 110px; border-radius: 50%;
       background: var(--teal);
       border: none;
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      gap: 5px;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 5px;
       cursor: pointer;
-      outline: 12px solid var(--teal-light);
-      transition: transform 0.15s, background 0.2s;
+      outline: 14px solid var(--teal-l);
+      transition: transform 0.15s, background 0.2s, outline-color 0.2s;
     }
     .big-btn:hover { transform: scale(1.04); }
     .big-btn:active { transform: scale(0.97); }
     .big-btn i { font-size: 30px; color: #fff; }
-    .big-btn span { font-size: 11px; color: #fff; font-weight: 600; font-family: inherit; }
-    .big-btn.waiting {
+    .big-btn span { font-size: 11px; color: #fff; font-weight: 600; }
+
+    .btn-stop {
+      width: 110px; height: 110px; border-radius: 50%;
       background: #888780;
-      outline-color: #F1EFE8;
+      border: none;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 5px;
+      cursor: pointer;
+      outline: 14px solid #F1EFE8;
+      transition: transform 0.15s;
+      display: none;
     }
+    .btn-stop:hover { transform: scale(1.04); }
+    .btn-stop i { font-size: 26px; color: #fff; }
+    .btn-stop span { font-size: 11px; color: #fff; font-weight: 600; }
 
-    .my-tags { display: flex; flex-wrap: wrap; gap: 5px; }
-    .my-tag {
-      font-size: 11px; padding: 4px 11px;
-      border-radius: 20px;
-      background: var(--teal-light); color: var(--teal-dark);
-      border: 0.5px solid var(--teal-mid);
-    }
-
-    .nearby-section { margin-top: 4px; }
-    .section-title {
-      font-size: 10px; font-weight: 600; color: var(--text2);
-      text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 8px;
-    }
-    .nearby-row {
-      display: flex; align-items: center; gap: 10px;
-      padding: 9px 0;
-      border-top: 0.5px solid var(--border);
-    }
-    .avatar {
-      width: 34px; height: 34px; border-radius: 50%;
-      background: var(--blue-light);
-      display: flex; align-items: center; justify-content: center;
-      font-size: 12px; font-weight: 600; color: var(--blue); flex-shrink: 0;
-    }
-    .nearby-info { flex: 1; }
-    .nearby-name { font-size: 13px; font-weight: 600; color: var(--text); }
-    .nearby-tags { font-size: 11px; color: var(--text2); }
-    .wave-btn {
-      font-size: 11px; padding: 6px 12px;
-      border-radius: 20px;
-      background: var(--teal); color: #fff;
-      border: none; cursor: pointer; font-family: inherit; font-weight: 500;
-      transition: opacity 0.15s;
-    }
-    .wave-btn:hover { opacity: 0.85; }
-
-    /* ---- SCREEN 3: Match ---- */
-    .match-anim {
-      display: flex; flex-direction: column; align-items: center;
-      padding: 14px 0 8px; gap: 8px;
-    }
-    .match-avatars { display: flex; align-items: center; position: relative; margin-bottom: 4px; }
-    .match-av {
+    /* ── Match scherm ── */
+    .match-header { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px 0; }
+    .match-avatars { display: flex; }
+    .av {
       width: 56px; height: 56px; border-radius: 50%;
       display: flex; align-items: center; justify-content: center;
-      font-size: 16px; font-weight: 600;
+      font-size: 16px; font-weight: 700;
       border: 3px solid var(--surface);
     }
-    .match-av.you { background: var(--teal-light); color: var(--teal-dark); }
-    .match-av.them { background: var(--blue-light); color: var(--blue); margin-left: -12px; }
+    .av.you  { background: var(--teal-l); color: var(--teal-d); }
+    .av.them { background: var(--blue-l); color: var(--blue); margin-left: -12px; }
+    .match-title { font-size: 22px; font-weight: 700; color: var(--text); }
+    .match-sub   { font-size: 14px; color: var(--text2); text-align: center; }
 
-    .match-title { font-size: 20px; font-weight: 700; color: var(--text); }
-    .match-sub { font-size: 13px; color: var(--text2); text-align: center; line-height: 1.5; padding: 0 4px; }
-
-    .match-topic-card {
-      background: var(--teal-light);
-      border-radius: var(--radius-lg);
-      border: 0.5px solid var(--teal-mid);
-      padding: 14px 16px; margin: 10px 0; width: 100%;
+    .topic-card {
+      background: var(--teal-l);
+      border: 0.5px solid var(--teal-m);
+      border-radius: var(--rl);
+      padding: 16px 18px;
     }
-    .match-topic-label {
-      font-size: 10px; color: var(--teal-dark); font-weight: 600;
-      text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 5px;
+    .topic-label { font-size: 10px; font-weight: 700; color: var(--teal-d); text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 5px; }
+    .topic-val   { font-size: 18px; font-weight: 700; color: var(--teal-dd); }
+    .topic-start { font-size: 13px; color: var(--teal-d); margin-top: 8px; font-style: italic; }
+
+    .match-actions { display: flex; gap: 10px; margin-top: 4px; }
+
+    /* ── Connect scherm ── */
+    .connect-center {
+      display: flex; flex-direction: column;
+      align-items: center; gap: 12px;
+      padding: 16px 0;
+      text-align: center;
     }
-    .match-topic-val { font-size: 16px; font-weight: 600; color: var(--teal-deep); }
-    .match-starter { font-size: 12px; color: var(--teal-dark); margin-top: 7px; font-style: italic; line-height: 1.5; }
+    .connect-emoji { font-size: 52px; line-height: 1; }
+    .connect-title { font-size: 22px; font-weight: 700; color: var(--text); }
+    .connect-sub   { font-size: 14px; color: var(--text2); line-height: 1.6; }
+    .connect-hint  { font-size: 12px; color: var(--text3); font-style: italic; line-height: 1.6; }
 
-    .waiting-txt { font-size: 12px; color: var(--text2); text-align: center; }
-
-    .match-actions { display: flex; gap: 8px; margin-top: auto; }
-    .btn-decline {
-      flex: 1; padding: 12px;
-      border: 0.5px solid var(--border2);
-      border-radius: var(--radius-md);
+    /* ── Knoppen ── */
+    .btn {
+      width: 100%; padding: 14px;
+      border-radius: var(--r);
+      font-size: 15px; font-weight: 600;
+      cursor: pointer; font-family: inherit;
+      transition: opacity 0.15s, transform 0.1s;
+      border: none;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn-primary { background: var(--teal); color: #fff; }
+    .btn-primary:hover { opacity: 0.88; }
+    .btn-secondary {
       background: var(--surface2);
       color: var(--text2);
-      font-size: 13px; cursor: pointer;
-      font-family: inherit; transition: background 0.15s;
+      border: 0.5px solid var(--border2) !important;
+      border: none;
     }
-    .btn-decline:hover { background: var(--border); }
-    .btn-accept {
-      flex: 2; padding: 12px;
-      background: var(--teal); color: #fff;
-      border: none; border-radius: var(--radius-md);
-      font-size: 13px; font-weight: 600; cursor: pointer;
-      font-family: inherit; transition: opacity 0.15s;
-    }
-    .btn-accept:hover { opacity: 0.88; }
+    .btn-secondary:hover { background: var(--border); }
+    .btn-danger { background: var(--surface2); color: #A32D2D; border: 0.5px solid #F09595 !important; border: none; }
 
-    /* ---- SCREEN 4: Verbonden ---- */
-    .connect-wrap {
-      display: flex; flex-direction: column; align-items: center;
-      flex: 1; justify-content: center; gap: 12px; padding: 8px 0;
+    /* ── Toast ── */
+    #error-toast {
+      position: fixed; bottom: 24px; left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #A32D2D; color: #fff;
+      padding: 10px 20px; border-radius: 20px;
+      font-size: 13px; font-weight: 500;
+      transition: transform 0.3s; z-index: 100;
+      white-space: nowrap;
     }
-    .connect-emoji { font-size: 48px; line-height: 1; }
-    .connect-title { font-size: 22px; font-weight: 700; color: var(--text); text-align: center; }
-    .connect-sub { font-size: 13px; color: var(--text2); text-align: center; line-height: 1.6; padding: 0 8px; }
-    .distance-pill {
-      padding: 7px 18px;
-      background: var(--teal-light);
-      border-radius: 20px;
-      font-size: 12px; font-weight: 600; color: var(--teal-dark);
-      border: 0.5px solid var(--teal-mid);
-    }
-    .opener-card {
-      width: 100%;
-      background: var(--surface2);
-      border-radius: var(--radius-lg);
-      border: 0.5px solid var(--border);
-      padding: 14px 16px; text-align: center;
-    }
-    .opener-label { font-size: 10px; color: var(--text2); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px; }
-    .opener-val { font-size: 14px; font-weight: 500; color: var(--text); line-height: 1.5; }
-
-    .connect-hint { font-size: 12px; color: var(--text3); text-align: center; font-style: italic; line-height: 1.6; }
-
-    .btn-done {
-      width: 100%; padding: 12px;
-      border: 0.5px solid var(--border2);
-      border-radius: var(--radius-md);
-      background: var(--surface2);
-      color: var(--text2);
-      font-size: 13px; cursor: pointer;
-      font-family: inherit; margin-top: auto;
-      transition: background 0.15s;
-    }
-    .btn-done:hover { background: var(--border); }
-
-    /* ---- Screen label ---- */
-    .screen-desc {
-      margin-top: 16px;
-      font-size: 12px; color: var(--text2);
-      text-align: center; letter-spacing: 0.01em;
-    }
-
-    /* ---- Footer ---- */
-    .footer {
-      margin-top: 40px;
-      font-size: 11px; color: var(--text3);
-      text-align: center; line-height: 1.7;
-    }
-    .footer a { color: var(--teal-dark); text-decoration: none; }
-
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #1a1a18;
-        --surface: #252523;
-        --surface2: #2e2e2b;
-        --border: rgba(255,255,255,0.10);
-        --border2: rgba(255,255,255,0.20);
-        --text: #f0efe9;
-        --text2: #a09f9a;
-        --text3: #6b6a65;
-      }
-    }
+    #error-toast.visible { transform: translateX(-50%) translateY(0); }
   </style>
 </head>
 <body>
 
-  <div class="app-header">
-    <div class="app-logo"><i class="ti ti-messages"></i></div>
+  <!-- App bar -->
+  <div class="app-bar">
+    <div class="logo"><i class="ti ti-messages"></i></div>
+    <span class="app-title">WaitTalk</span>
+    <div class="app-bar-actions">
+      <button class="icon-btn" id="btn-edit-profile" title="Profiel bewerken">
+        <i class="ti ti-user"></i>
+      </button>
+    </div>
+  </div>
+
+  <!-- SCHERM: Profiel aanmaken -->
+  <div class="screen" id="screen-profile">
+    <div class="greeting">Hoi, ik ben...</div>
+    <p style="font-size:14px; color:var(--text2);">Vertel wat je leuk vindt. We koppelen je aan iemand dichtbij die ook wil praten.</p>
+
     <div>
-      <div class="app-name">WaitTalk</div>
-      <div class="app-tag">Praat met wie naast je staat</div>
-    </div>
-    <div class="proto-badge">Prototype</div>
-  </div>
-
-  <div class="nav-tabs">
-    <button class="tab-btn active" onclick="showScreen('onboard', this)">1 · Profiel</button>
-    <button class="tab-btn" onclick="showScreen('wacht', this)">2 · Wachtstand</button>
-    <button class="tab-btn" onclick="showScreen('match', this)">3 · Match</button>
-    <button class="tab-btn" onclick="showScreen('connect', this)">4 · Verbonden</button>
-  </div>
-
-  <div class="phone">
-    <div class="phone-notch"></div>
-
-    <!-- SCREEN 1: Profiel -->
-    <div class="screen active" id="s-onboard">
-      <div class="onboard-icon"><i class="ti ti-messages"></i></div>
-      <div class="onboard-title">Hoi, ik ben...</div>
-      <div class="onboard-sub">Vertel wat je leuk vindt. We koppelen je aan iemand dichtbij die ook wil praten.</div>
-
       <div class="field-label">Voornaam</div>
-      <div class="fake-input">Sanne</div>
+      <input type="text" id="input-name" placeholder="Jouw voornaam" maxlength="30" />
+    </div>
 
-      <div class="field-label">Waar wil je over praten?</div>
+    <div>
+      <div class="field-label" style="margin-bottom:10px">Waar wil je over praten? (kies meerdere)</div>
       <div class="topics-grid">
-        <div class="topic-chip sel" onclick="toggleChip(this)">Voetbal</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Muziek</div>
-        <div class="topic-chip sel" onclick="toggleChip(this)">Tech</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Reizen</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Koken</div>
-        <div class="topic-chip sel" onclick="toggleChip(this)">Boeken</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Werk</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Films</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Sport</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Nieuws</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Duurzaamheid</div>
-        <div class="topic-chip" onclick="toggleChip(this)">Kunst</div>
+        <div class="topic-chip sel" data-topic="Voetbal">Voetbal</div>
+        <div class="topic-chip"     data-topic="Muziek">Muziek</div>
+        <div class="topic-chip sel" data-topic="Tech">Tech</div>
+        <div class="topic-chip"     data-topic="Reizen">Reizen</div>
+        <div class="topic-chip"     data-topic="Koken">Koken</div>
+        <div class="topic-chip sel" data-topic="Boeken">Boeken</div>
+        <div class="topic-chip"     data-topic="Werk">Werk</div>
+        <div class="topic-chip"     data-topic="Films">Films</div>
+        <div class="topic-chip"     data-topic="Sport">Sport</div>
+        <div class="topic-chip"     data-topic="Nieuws">Nieuws</div>
+        <div class="topic-chip"     data-topic="Duurzaamheid">Duurzaamheid</div>
+        <div class="topic-chip"     data-topic="Kunst">Kunst</div>
       </div>
+    </div>
 
-      <button class="btn-primary" onclick="showScreen('wacht', document.querySelectorAll('.tab-btn')[1])">
-        Klaar &rarr; ga naar wachtstand
+    <button class="btn btn-primary" id="btn-save-profile">Opslaan en doorgaan</button>
+  </div>
+
+  <!-- SCHERM: Home / Wachtstand -->
+  <div class="screen" id="screen-home">
+    <div id="home-greeting" class="greeting">Hoi!</div>
+
+    <div class="my-tags" id="home-tags"></div>
+
+    <div class="wait-card">
+      <div class="wait-hint" id="wait-status">Tik om te starten</div>
+
+      <button class="big-btn" id="btn-start-waiting">
+        <i class="ti ti-hand-stop"></i>
+        <span>Ik wacht</span>
+      </button>
+
+      <button class="btn-stop" id="btn-stop-waiting">
+        <i class="ti ti-x"></i>
+        <span>Stop</span>
       </button>
     </div>
 
-    <!-- SCREEN 2: Wachtstand -->
-    <div class="screen" id="s-wacht">
-      <div class="wait-header">
-        <div class="greeting">Hoi Sanne</div>
-        <div class="status-row">
-          <div class="status-dot active" id="dot"></div>
-          <div class="status-txt" id="stxt">Actief</div>
-        </div>
-      </div>
-
-      <div class="wait-card">
-        <div class="wait-hint" id="wait-hint">Tik om te activeren</div>
-        <button class="big-btn" id="big-btn" onclick="toggleWait()">
-          <i class="ti ti-hand-stop" id="btn-icon"></i>
-          <span id="btn-label">Ik wacht</span>
-        </button>
-        <div class="my-tags">
-          <span class="my-tag">Voetbal</span>
-          <span class="my-tag">Tech</span>
-          <span class="my-tag">Boeken</span>
-        </div>
-      </div>
-
-      <div class="nearby-section" id="nearby" style="display:none">
-        <div class="section-title">Mensen dichtbij</div>
-        <div class="nearby-row">
-          <div class="avatar">ML</div>
-          <div class="nearby-info">
-            <div class="nearby-name">Marc</div>
-            <div class="nearby-tags">Tech · Reizen · 18m</div>
-          </div>
-          <button class="wave-btn" onclick="showScreen('match', document.querySelectorAll('.tab-btn')[2])">Zwaai 👋</button>
-        </div>
-        <div class="nearby-row">
-          <div class="avatar" style="background:var(--amber-light);color:var(--amber);">KV</div>
-          <div class="nearby-info">
-            <div class="nearby-name">Kim</div>
-            <div class="nearby-tags">Boeken · Muziek · 31m</div>
-          </div>
-          <button class="wave-btn" onclick="showScreen('match', document.querySelectorAll('.tab-btn')[2])">Zwaai 👋</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- SCREEN 3: Match -->
-    <div class="screen" id="s-match">
-      <div class="match-anim">
-        <div class="match-avatars">
-          <div class="match-av you">SA</div>
-          <div class="match-av them">ML</div>
-        </div>
-        <div class="match-title">Match gevonden!</div>
-        <div class="match-sub">Marc is 18 meter bij je vandaan en wil ook praten</div>
-      </div>
-
-      <div class="match-topic-card">
-        <div class="match-topic-label">Gezamenlijk onderwerp</div>
-        <div class="match-topic-val">Tech</div>
-        <div class="match-starter">"Vraag: wat vind jij van AI in het dagelijks leven?"</div>
-      </div>
-
-      <div class="waiting-txt">Marc wacht op jouw reactie...</div>
-
-      <div class="match-actions">
-        <button class="btn-decline" onclick="showScreen('wacht', document.querySelectorAll('.tab-btn')[1])">Nu even niet</button>
-        <button class="btn-accept" onclick="showScreen('connect', document.querySelectorAll('.tab-btn')[3])">Ja, zwaai maar! 👋</button>
-      </div>
-    </div>
-
-    <!-- SCREEN 4: Verbonden -->
-    <div class="screen" id="s-connect">
-      <div class="connect-wrap">
-        <div class="connect-emoji">👋</div>
-        <div class="connect-title">Jullie zijn verbonden!</div>
-        <div class="distance-pill">Marc is ~18 meter bij je</div>
-        <div class="connect-sub">Loop naar elkaar toe en zeg gewoon hallo. De app doet de rest niet — dat doe jij.</div>
-
-        <div class="opener-card">
-          <div class="opener-label">Gespreksopener</div>
-          <div class="opener-val">"Wat vind jij van AI in het dagelijks leven?"</div>
-        </div>
-
-        <div class="connect-hint">Na het gesprek? Geen verdere koppeling, geen social media. Gewoon een goed praatje.</div>
-      </div>
-
-      <button class="btn-done" onclick="showScreen('wacht', document.querySelectorAll('.tab-btn')[1])">
-        Klaar — terug naar wachtstand
-      </button>
-    </div>
-
+    <p style="font-size:12px; color:var(--text3); text-align:center; line-height:1.6;">
+      Activeer alleen als je écht aan het wachten bent. De app is max. 30 minuten actief.
+    </p>
   </div>
 
-  <div class="screen-desc" id="screen-desc">Stap 1 van 4 — Profiel aanmaken</div>
+  <!-- SCHERM: Match gevonden -->
+  <div class="screen" id="screen-match">
+    <div class="match-header">
+      <div class="match-avatars">
+        <div class="av you"  id="av-you">JJ</div>
+        <div class="av them" id="av-them">??</div>
+      </div>
+      <div class="match-title">Match gevonden!</div>
+      <div class="match-sub" id="match-name-sub">iemand wil ook praten</div>
+    </div>
 
-  <div class="footer">
-    WaitTalk – UX Concept Prototype &nbsp;·&nbsp; Versie 0.1<br>
-    Gebouwd om te testen, niet om te lanceren. Nog geen echte Bluetooth-koppeling.
+    <div class="topic-card">
+      <div class="topic-label">Gezamenlijk onderwerp</div>
+      <div class="topic-val"   id="match-topic">—</div>
+      <div class="topic-start" id="match-starter">—</div>
+    </div>
+
+    <p style="font-size:13px; color:var(--text2); text-align:center;">
+      <strong id="match-name">Iemand</strong> wacht op jouw reactie...
+    </p>
+
+    <div class="match-actions">
+      <button class="btn btn-secondary" id="btn-decline-match" style="flex:1">Nu even niet</button>
+      <button class="btn btn-primary"   id="btn-accept-match"  style="flex:2">Ja, zwaai maar! 👋</button>
+    </div>
   </div>
 
-  <script>
-    const screenLabels = {
-      onboard: 'Stap 1 van 4 — Profiel aanmaken',
-      wacht:   'Stap 2 van 4 — Wachtstand activeren',
-      match:   'Stap 3 van 4 — Match ontvangen',
-      connect: 'Stap 4 van 4 — Verbinding gemaakt'
-    };
+  <!-- SCHERM: Verbonden -->
+  <div class="screen" id="screen-connect">
+    <div class="connect-center">
+      <div class="connect-emoji">👋</div>
+      <div class="connect-title">Jullie zijn verbonden!</div>
+      <div style="padding:5px 14px; background:var(--teal-l); border-radius:20px; font-size:13px; font-weight:600; color:var(--teal-d); border: 0.5px solid var(--teal-m);">
+        Loop naar <span id="connect-name">elkaar</span> toe
+      </div>
+      <div class="connect-sub">Zeg gewoon hallo. De app doet de rest niet — dat doe jij.</div>
 
-    function showScreen(id, btn) {
-      document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-      document.getElementById('s-' + id).classList.add('active');
-      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-      if (btn) btn.classList.add('active');
-      document.getElementById('screen-desc').textContent = screenLabels[id] || '';
-    }
+      <div style="width:100%; background:var(--surface2); border-radius:var(--rl); border:0.5px solid var(--border); padding:16px 18px; text-align:center;">
+        <div style="font-size:10px; font-weight:700; color:var(--text2); text-transform:uppercase; letter-spacing:0.07em; margin-bottom:6px;">Gespreksopener over <span id="connect-topic">—</span></div>
+        <div style="font-size:15px; font-weight:500; color:var(--text);" id="connect-starter">—</div>
+      </div>
 
-    function toggleChip(el) {
-      el.classList.toggle('sel');
-    }
+      <div class="connect-hint">Na het gesprek? Geen verdere koppeling, geen social media. Gewoon een goed praatje.</div>
+    </div>
 
-    let waiting = false;
-    let timer = null;
+    <button class="btn btn-secondary" id="btn-done">Klaar — terug naar begin</button>
+  </div>
 
-    function toggleWait() {
-      waiting = !waiting;
-      const btn     = document.getElementById('big-btn');
-      const dot     = document.getElementById('dot');
-      const stxt    = document.getElementById('stxt');
-      const hint    = document.getElementById('wait-hint');
-      const nearby  = document.getElementById('nearby');
-      const icon    = document.getElementById('btn-icon');
-      const label   = document.getElementById('btn-label');
+  <!-- Toast voor foutmeldingen -->
+  <div id="error-toast"></div>
 
-      if (waiting) {
-        btn.classList.add('waiting');
-        label.textContent = 'Zoeken...';
-        icon.className = 'ti ti-loader';
-        dot.classList.remove('active');
-        stxt.textContent = 'Zoekend';
-        hint.textContent = 'We zoeken iemand dichtbij...';
-        nearby.style.display = 'none';
-
-        timer = setTimeout(() => {
-          nearby.style.display = 'block';
-          hint.textContent = '2 mensen dichtbij gevonden!';
-          dot.classList.add('active');
-          stxt.textContent = 'Match gevonden!';
-          label.textContent = 'Stop';
-          icon.className = 'ti ti-x';
-          btn.classList.remove('waiting');
-          btn.style.background = '#1D9E75';
-          btn.style.outlineColor = '#E1F5EE';
-        }, 2000);
-      } else {
-        clearTimeout(timer);
-        btn.classList.remove('waiting');
-        btn.style.background = '';
-        btn.style.outlineColor = '';
-        label.textContent = 'Ik wacht';
-        icon.className = 'ti ti-hand-stop';
-        dot.classList.add('active');
-        stxt.textContent = 'Actief';
-        hint.textContent = 'Tik om te activeren';
-        nearby.style.display = 'none';
-      }
-    }
-  </script>
 </body>
 </html>
