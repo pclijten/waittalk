@@ -14,7 +14,7 @@
     import { initializeApp }       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
     import { getAuth, signInAnonymously, onAuthStateChanged }
                                    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    import { getDatabase, ref, set, onValue, remove, serverTimestamp }
+    import { getDatabase, ref, set, onValue, remove, serverTimestamp, off }
                                    from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
     const firebaseConfig = {
@@ -32,30 +32,27 @@
     const auth = getAuth(app);
     const db   = getDatabase(app);
 
-    // ── Globale state ─────────────────────────────────────────
-    let currentUser   = null;
-    let activeRef     = null;
-    let matchWatcher  = null;
-    let bleDevice     = null;   // verbonden BLE device (scanner-kant)
-    let scanInterval  = null;   // herhaaldelijk scannen
-    let waitTimeout   = null;   // auto-stop na 30 min
+    // ── Config ────────────────────────────────────────────────
+    const MAX_DISTANCE_METERS = 50;   // match binnen 50 meter
+    const SCAN_INTERVAL_MS    = 8000; // elke 8 seconden opnieuw scannen
+    const MAX_WAIT_MS         = 30 * 60 * 1000; // auto-stop na 30 min
 
-    // Unieke WaitTalk service UUID — alle WaitTalk apps herkennen elkaar hieraan
-    const WT_SERVICE_UUID = "0000181c-0000-1000-8000-00805f9b34fb";
-    // Characteristic waarin we de Firebase UID opslaan (max 20 bytes)
-    const WT_CHAR_UUID    = "00002a19-0000-1000-8000-00805f9b34fb";
+    // ── State ─────────────────────────────────────────────────
+    let currentUser  = null;
+    let activeRef    = null;
+    let matchWatcher = null;
+    let scanInterval = null;
+    let waitTimeout  = null;
+    let geoWatcher   = null;
+    let myCoords     = null;   // { lat, lng } meest recente positie
 
-    // ── DOM klaar ────────────────────────────────────────────
+    // ── DOM klaar ─────────────────────────────────────────────
     window.addEventListener("DOMContentLoaded", () => {
       loadProfile();
 
       onAuthStateChanged(auth, user => {
-        if (user) {
-          currentUser = user;
-          showScreen("home");
-        } else {
-          signInAnonymously(auth).catch(err => showError("Inloggen mislukt: " + err.message));
-        }
+        if (user) { currentUser = user; }
+        else { signInAnonymously(auth).catch(e => showError("Inloggen mislukt")); }
       });
 
       document.getElementById("btn-save-profile").addEventListener("click",  saveProfile);
@@ -65,39 +62,17 @@
       document.getElementById("btn-decline-match").addEventListener("click", declineMatch);
       document.getElementById("btn-done").addEventListener("click",          finishChat);
       document.getElementById("btn-edit-profile").addEventListener("click",  () => showScreen("profile"));
-
-      document.querySelectorAll(".topic-chip").forEach(chip => {
-        chip.addEventListener("click", () => chip.classList.toggle("sel"));
-      });
-
-      // Check of Bluetooth beschikbaar is, toon waarschuwing als dat niet zo is
-      checkBluetooth();
+      document.querySelectorAll(".topic-chip").forEach(c =>
+        c.addEventListener("click", () => c.classList.toggle("sel")));
     });
-
-    // ── Bluetooth beschikbaarheidscheck ──────────────────────
-    async function checkBluetooth() {
-      if (!navigator.bluetooth) {
-        showBtWarning("Bluetooth wordt niet ondersteund door deze browser. Gebruik Chrome op Android.");
-        return;
-      }
-      const available = await navigator.bluetooth.getAvailability().catch(() => false);
-      if (!available) {
-        showBtWarning("Bluetooth staat uit op dit apparaat. Zet het aan voor nabijheidsdetectie.");
-      }
-    }
-
-    function showBtWarning(msg) {
-      const el = document.getElementById("bt-warning");
-      if (el) { el.textContent = "⚠️ " + msg; el.style.display = "block"; }
-    }
 
     // ── Profiel ───────────────────────────────────────────────
     function saveProfile() {
       const name = document.getElementById("input-name").value.trim();
       if (!name) { showError("Voer een naam in"); return; }
-      const selected = [...document.querySelectorAll(".topic-chip.sel")].map(c => c.dataset.topic);
-      if (selected.length === 0) { showError("Kies minstens één onderwerp"); return; }
-      const profile = { name, topics: selected };
+      const topics = [...document.querySelectorAll(".topic-chip.sel")].map(c => c.dataset.topic);
+      if (!topics.length) { showError("Kies minstens één onderwerp"); return; }
+      const profile = { name, topics };
       localStorage.setItem("wt_profile", JSON.stringify(profile));
       renderHome(profile);
       showScreen("home");
@@ -106,177 +81,181 @@
     function loadProfile() {
       const raw = localStorage.getItem("wt_profile");
       if (!raw) { showScreen("profile"); return; }
-      const profile = JSON.parse(raw);
-      document.getElementById("input-name").value = profile.name;
-      document.querySelectorAll(".topic-chip").forEach(chip => {
-        chip.classList.toggle("sel", profile.topics.includes(chip.dataset.topic));
-      });
-      renderHome(profile);
+      const p = JSON.parse(raw);
+      document.getElementById("input-name").value = p.name;
+      document.querySelectorAll(".topic-chip").forEach(c =>
+        c.classList.toggle("sel", p.topics.includes(c.dataset.topic)));
+      renderHome(p);
+      showScreen("home");
     }
 
     function getProfile() {
-      const raw = localStorage.getItem("wt_profile");
-      return raw ? JSON.parse(raw) : null;
+      const r = localStorage.getItem("wt_profile");
+      return r ? JSON.parse(r) : null;
     }
 
-    function renderHome(profile) {
-      document.getElementById("home-greeting").textContent = "Hoi " + profile.name;
+    function renderHome(p) {
+      document.getElementById("home-greeting").textContent = "Hoi " + p.name;
       document.getElementById("home-tags").innerHTML =
-        profile.topics.map(t => `<span class="my-tag">${t}</span>`).join("");
+        p.topics.map(t => `<span class="my-tag">${t}</span>`).join("");
     }
 
     // ── Wachtstand starten ────────────────────────────────────
     async function startWaiting() {
-      if (!currentUser) return;
+      if (!currentUser) { showError("Even geduld, verbinding wordt gemaakt..."); return; }
       const profile = getProfile();
       if (!profile) { showScreen("profile"); return; }
 
-      // Bluetooth verplicht op Android Chrome
-      if (!navigator.bluetooth) {
-        showError("Bluetooth niet beschikbaar. Gebruik Chrome op Android.");
+      if (!navigator.geolocation) {
+        showError("Locatie niet beschikbaar op dit apparaat.");
         return;
       }
 
       setWaitingUI(true);
-      setStatus("Bluetooth inschakelen...", "searching");
+      setStatus("Locatie ophalen...", "searching");
 
-      // 1. Schrijf jezelf in Firebase
-      activeRef = ref(db, "active_users/" + currentUser.uid);
-      await set(activeRef, {
-        name:      profile.name,
-        topics:    profile.topics,
-        uid:       currentUser.uid,
-        timestamp: serverTimestamp(),
-        matched:   false
-      });
+      // 1. Vraag locatie op — dit triggert de toestemmingsdialoog
+      navigator.geolocation.getCurrentPosition(
+        async (pos) => {
+          myCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setStatus("Locatie gevonden. Zoeken naar mensen dichtbij...", "searching");
 
-      // 2. Luister op Firebase of er een match voor ons binnenkomt
-      matchWatcher = onValue(activeRef, snapshot => {
-        const data = snapshot.val();
-        if (data && data.matched && data.matchedWith) {
-          handleMatch(data.matchedWith);
-        }
-      });
+          // 2. Schrijf naar Firebase met locatie
+          activeRef = ref(db, "active_users/" + currentUser.uid);
+          await set(activeRef, {
+            name:      profile.name,
+            topics:    profile.topics,
+            lat:       myCoords.lat,
+            lng:       myCoords.lng,
+            timestamp: serverTimestamp(),
+            matched:   false
+          });
 
-      // 3. Start BLE scannen (herhaald elke 8 seconden)
-      await startBleScan(profile);
-      scanInterval = setInterval(() => startBleScan(profile), 8000);
+          // 3. Luister of iemand anders ons matcht
+          matchWatcher = onValue(activeRef, snap => {
+            const d = snap.val();
+            if (d && d.matched && d.matchedWith) handleMatch(d.matchedWith);
+          });
 
-      // 4. Auto-stop na 30 minuten
-      waitTimeout = setTimeout(() => {
-        stopWaiting();
-        showError("Wachtstand automatisch gestopt na 30 minuten.");
-      }, 30 * 60 * 1000);
+          // 4. Wij scannen ook actief
+          scanForMatches(profile);
+          scanInterval = setInterval(() => scanForMatches(profile), SCAN_INTERVAL_MS);
+
+          // 5. Locatie bijhouden terwijl we wachten
+          geoWatcher = navigator.geolocation.watchPosition(pos => {
+            myCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+            if (activeRef) {
+              set(ref(db, "active_users/" + currentUser.uid + "/lat"), myCoords.lat);
+              set(ref(db, "active_users/" + currentUser.uid + "/lng"), myCoords.lng);
+            }
+          }, null, { enableHighAccuracy: true });
+
+          // 6. Auto-stop na 30 min
+          waitTimeout = setTimeout(() => {
+            stopWaiting();
+            showError("Wachtstand gestopt na 30 minuten.");
+          }, MAX_WAIT_MS);
+        },
+        (err) => {
+          setWaitingUI(false);
+          setStatus("Tik om te starten", "");
+          if (err.code === 1) showError("Locatietoestemming geweigerd. Sta locatie toe in Chrome.");
+          else showError("Locatie ophalen mislukt: " + err.message);
+        },
+        { enableHighAccuracy: true, timeout: 10000 }
+      );
     }
 
     // ── Wachtstand stoppen ────────────────────────────────────
     async function stopWaiting() {
       setWaitingUI(false);
       setStatus("Tik om te starten", "");
-
       clearInterval(scanInterval); scanInterval = null;
       clearTimeout(waitTimeout);   waitTimeout  = null;
-
+      if (geoWatcher !== null) { navigator.geolocation.clearWatch(geoWatcher); geoWatcher = null; }
       if (matchWatcher) { matchWatcher(); matchWatcher = null; }
       if (activeRef)    { await remove(activeRef); activeRef = null; }
-
-      // BLE device loskoppelen als het nog verbonden is
-      if (bleDevice && bleDevice.gatt.connected) {
-        bleDevice.gatt.disconnect();
-        bleDevice = null;
-      }
     }
 
-    // ── BLE scannen ───────────────────────────────────────────
-    // Web Bluetooth werkt via requestDevice: de gebruiker kiest een device.
-    // We filteren op onze eigen service UUID zodat alleen WaitTalk-apparaten
-    // zichtbaar zijn. Na verbinding lezen we de characteristic uit (de UID
-    // van de andere gebruiker) en zoeken we die op in Firebase.
-    async function startBleScan(profile) {
-      if (!navigator.bluetooth) return;
+    // ── Afstand berekenen (Haversine formule) ─────────────────
+    function getDistanceMeters(lat1, lng1, lat2, lng2) {
+      const R  = 6371000; // aarde in meters
+      const dL = (lat2 - lat1) * Math.PI / 180;
+      const dl = (lng2 - lng1) * Math.PI / 180;
+      const a  = Math.sin(dL/2) ** 2 +
+                 Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) * Math.sin(dl/2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    }
 
-      setStatus("Scannen naar mensen dichtbij...", "searching");
+    // ── Scannen naar matches ──────────────────────────────────
+    function scanForMatches(profile) {
+      if (!myCoords || !currentUser) return;
+      const usersRef = ref(db, "active_users");
 
-      try {
-        // requestDevice opent een native picker — enkel WaitTalk-devices zichtbaar
-        const device = await navigator.bluetooth.requestDevice({
-          filters: [{ services: [WT_SERVICE_UUID] }],
-          optionalServices: [WT_SERVICE_UUID]
-        });
+      onValue(usersRef, snap => {
+        const all = snap.val();
+        if (!all) { setStatus("Niemand actief dichtbij. Wachten...", "searching"); return; }
 
-        bleDevice = device;
-        setStatus("Iemand gevonden! Interesses vergelijken...", "found");
+        let nearbyCount = 0;
 
-        // Verbinding maken
-        const server = await device.gatt.connect();
-        const service = await server.getPrimaryService(WT_SERVICE_UUID);
-        const char    = await service.getCharacteristic(WT_CHAR_UUID);
+        for (const [uid, data] of Object.entries(all)) {
+          if (uid === currentUser.uid) continue;
+          if (data.matched) continue;
+          if (!data.lat || !data.lng) continue;
 
-        // UID van de andere gebruiker uitlezen
-        const value     = await char.readValue();
-        const theirUid  = new TextDecoder().decode(value).trim();
+          const dist = getDistanceMeters(myCoords.lat, myCoords.lng, data.lat, data.lng);
 
-        device.gatt.disconnect();
-
-        if (!theirUid || theirUid === currentUser.uid) return;
-
-        // Opzoeken in Firebase en match proberen
-        const theirRef = ref(db, "active_users/" + theirUid);
-        onValue(theirRef, snapshot => {
-          const theirData = snapshot.val();
-          if (!theirData || theirData.matched) return;
-
-          const overlap = profile.topics.filter(t => theirData.topics?.includes(t));
-          if (overlap.length > 0) {
-            proposeMatch(theirUid, theirData, overlap[0]);
-          } else {
-            setStatus("Iemand dichtbij, maar geen overlap in interesses.", "searching");
+          if (dist <= MAX_DISTANCE_METERS) {
+            nearbyCount++;
+            const overlap = profile.topics.filter(t => data.topics?.includes(t));
+            if (overlap.length > 0) {
+              proposeMatch(uid, data, overlap[0], Math.round(dist));
+              off(usersRef); // stop luisteren
+              return;
+            }
           }
-        }, { onlyOnce: true });
-
-      } catch (err) {
-        // Gebruiker annuleerde de picker of geen device gevonden — stil afhandelen
-        if (err.name === "NotFoundError") {
-          setStatus("Niemand dichtbij gevonden. Opnieuw zoeken...", "searching");
-        } else if (err.name === "NotAllowedError") {
-          setStatus("Bluetooth-toestemming geweigerd.", "");
-          stopWaiting();
-        } else {
-          console.warn("BLE fout:", err);
-          setStatus("Zoeken... (probeer opnieuw)", "searching");
         }
-      }
+
+        if (nearbyCount > 0) {
+          setStatus(`${nearbyCount} persoon dichtbij, maar geen overlap in interesses.`, "searching");
+        } else {
+          setStatus("Niemand dichtbij gevonden. Opnieuw zoeken...", "searching");
+        }
+      }, { onlyOnce: true });
     }
 
     // ── Match voorstellen ─────────────────────────────────────
-    async function proposeMatch(theirUid, theirData, sharedTopic) {
+    async function proposeMatch(theirUid, theirData, sharedTopic, distMeters) {
       if (!activeRef || !currentUser) return;
       const profile = getProfile();
-
       clearInterval(scanInterval); scanInterval = null;
 
       await set(ref(db, "active_users/" + currentUser.uid), {
         name:        profile.name,
         topics:      profile.topics,
-        uid:         currentUser.uid,
+        lat:         myCoords.lat,
+        lng:         myCoords.lng,
         timestamp:   serverTimestamp(),
         matched:     true,
-        matchedWith: { uid: theirUid, name: theirData.name, topic: sharedTopic }
+        matchedWith: {
+          uid:      theirUid,
+          name:     theirData.name,
+          topic:    sharedTopic,
+          distance: distMeters
+        }
       });
-      // Schrijf match ook naar de andere gebruiker
-      await set(ref(db, "active_users/" + theirUid + "/matched"),     true);
+      await set(ref(db, "active_users/" + theirUid + "/matched"), true);
       await set(ref(db, "active_users/" + theirUid + "/matchedWith"), {
-        uid:   currentUser.uid,
-        name:  profile.name,
-        topic: sharedTopic
+        uid:      currentUser.uid,
+        name:     profile.name,
+        topic:    sharedTopic,
+        distance: distMeters
       });
     }
 
     // ── Match ontvangen ───────────────────────────────────────
     function handleMatch(matchData) {
-      // Voorkom dubbele triggers
       if (matchWatcher) { matchWatcher(); matchWatcher = null; }
-
       clearInterval(scanInterval); scanInterval = null;
       clearTimeout(waitTimeout);   waitTimeout  = null;
       setWaitingUI(false);
@@ -285,15 +264,14 @@
       document.getElementById("match-topic").textContent   = matchData.topic;
       document.getElementById("match-starter").textContent =
         starters[matchData.topic] || "Wat vind jij er van?";
+      document.getElementById("match-distance").textContent =
+        matchData.distance ? `~${matchData.distance}m bij je vandaan` : "dichtbij";
 
-      const myInit    = getProfile()?.name?.slice(0,2).toUpperCase() || "JJ";
-      const theirInit = matchData.name.slice(0,2).toUpperCase();
+      const myInit = getProfile()?.name?.slice(0,2).toUpperCase() || "JJ";
       document.getElementById("av-you").textContent  = myInit;
-      document.getElementById("av-them").textContent = theirInit;
+      document.getElementById("av-them").textContent = matchData.name.slice(0,2).toUpperCase();
 
-      // Trilling als feedback
       if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
-
       showScreen("match");
     }
 
@@ -301,6 +279,7 @@
       document.getElementById("connect-name").textContent    = document.getElementById("match-name").textContent;
       document.getElementById("connect-topic").textContent   = document.getElementById("match-topic").textContent;
       document.getElementById("connect-starter").textContent = document.getElementById("match-starter").textContent;
+      document.getElementById("connect-distance").textContent = document.getElementById("match-distance").textContent;
       if (navigator.vibrate) navigator.vibrate(300);
       showScreen("connect");
     }
@@ -310,14 +289,12 @@
       showScreen("home");
     }
 
-    function finishChat() {
-      showScreen("home");
-    }
+    function finishChat() { showScreen("home"); }
 
     // ── UI helpers ────────────────────────────────────────────
     function setWaitingUI(active) {
-      document.getElementById("btn-start-waiting").style.display = active ? "none"  : "flex";
-      document.getElementById("btn-stop-waiting").style.display  = active ? "flex"  : "none";
+      document.getElementById("btn-start-waiting").style.display = active ? "none" : "flex";
+      document.getElementById("btn-stop-waiting").style.display  = active ? "flex" : "none";
     }
 
     function setStatus(msg, cls) {
@@ -338,7 +315,6 @@
       setTimeout(() => el.classList.remove("visible"), 4000);
     }
 
-    // ── Gespreksopeners ───────────────────────────────────────
     const starters = {
       "Voetbal":      "Welk team volg jij al het langst?",
       "Tech":         "Wat vind jij van AI in het dagelijks leven?",
@@ -357,170 +333,97 @@
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     :root {
-      --bg:      #f5f4f0;  --surface:  #ffffff;  --surface2: #f0efeb;
-      --border:  rgba(0,0,0,0.11);  --border2: rgba(0,0,0,0.20);
-      --text:    #1a1a18;  --text2:    #6b6a65;  --text3:    #a09f9a;
-      --teal:    #1D9E75;  --teal-l:   #E1F5EE;  --teal-m:   #5DCAA5;
-      --teal-d:  #0F6E56;  --teal-dd:  #085041;
-      --blue-l:  #E6F1FB;  --blue:     #185FA5;
-      --amber-l: #FAEEDA;  --amber:    #854F0B;
-      --r: 8px;  --rl: 14px;
+      --bg:#f5f4f0; --surface:#fff; --surface2:#f0efeb;
+      --border:rgba(0,0,0,0.11); --border2:rgba(0,0,0,0.20);
+      --text:#1a1a18; --text2:#6b6a65; --text3:#a09f9a;
+      --teal:#1D9E75; --teal-l:#E1F5EE; --teal-m:#5DCAA5;
+      --teal-d:#0F6E56; --teal-dd:#085041;
+      --blue-l:#E6F1FB; --blue:#185FA5;
+      --r:8px; --rl:14px;
     }
     @media (prefers-color-scheme: dark) {
       :root {
-        --bg: #181816; --surface: #242422; --surface2: #2c2c2a;
-        --border: rgba(255,255,255,0.09); --border2: rgba(255,255,255,0.18);
-        --text: #eeede7; --text2: #9c9a92; --text3: #68675f;
+        --bg:#181816; --surface:#242422; --surface2:#2c2c2a;
+        --border:rgba(255,255,255,0.09); --border2:rgba(255,255,255,0.18);
+        --text:#eeede7; --text2:#9c9a92; --text3:#68675f;
       }
     }
+    body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); min-height:100svh; display:flex; flex-direction:column; align-items:center; }
 
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: var(--bg); min-height: 100svh;
-      display: flex; flex-direction: column; align-items: center;
-    }
+    .app-bar { width:100%; max-width:480px; padding:14px 20px 10px; display:flex; align-items:center; gap:10px; position:sticky; top:0; background:var(--bg); z-index:10; border-bottom:0.5px solid var(--border); }
+    .logo { width:32px; height:32px; background:var(--teal); border-radius:9px; display:flex; align-items:center; justify-content:center; }
+    .logo i { font-size:18px; color:#fff; }
+    .app-title { font-size:18px; font-weight:700; color:var(--text); letter-spacing:-0.02em; }
+    .icon-btn { margin-left:auto; background:none; border:none; color:var(--text2); font-size:20px; cursor:pointer; padding:4px; border-radius:var(--r); }
 
-    .app-bar {
-      width: 100%; max-width: 480px; padding: 14px 20px 10px;
-      display: flex; align-items: center; gap: 10px;
-      position: sticky; top: 0; background: var(--bg); z-index: 10;
-      border-bottom: 0.5px solid var(--border);
-    }
-    .logo { width: 32px; height: 32px; background: var(--teal); border-radius: 9px;
-            display: flex; align-items: center; justify-content: center; }
-    .logo i { font-size: 18px; color: #fff; }
-    .app-title { font-size: 18px; font-weight: 700; color: var(--text); letter-spacing: -0.02em; }
-    .app-bar-actions { margin-left: auto; }
-    .icon-btn { background: none; border: none; color: var(--text2);
-                font-size: 20px; cursor: pointer; padding: 4px; border-radius: var(--r); }
-    .icon-btn:hover { color: var(--text); }
+    .screen { display:none; flex-direction:column; width:100%; max-width:480px; padding:20px; gap:16px; }
+    .screen.active { display:flex; }
 
-    /* ── Bluetooth waarschuwing ── */
-    #bt-warning {
-      display: none;
-      width: 100%; max-width: 480px;
-      padding: 10px 20px;
-      background: #FAEEDA; color: #633806;
-      font-size: 12px; line-height: 1.5;
-      border-bottom: 0.5px solid #FAC775;
-    }
+    .greeting { font-size:22px; font-weight:700; color:var(--text); letter-spacing:-0.02em; }
+    .field-label { font-size:13px; color:var(--text2); margin-bottom:5px; }
+    input[type="text"] { width:100%; padding:11px 14px; border:0.5px solid var(--border2); border-radius:var(--r); font-size:15px; background:var(--surface); color:var(--text); font-family:inherit; outline:none; }
+    input[type="text"]:focus { border-color:var(--teal); box-shadow:0 0 0 3px rgba(29,158,117,0.15); }
 
-    /* ── Schermen ── */
-    .screen { display: none; flex-direction: column; width: 100%; max-width: 480px; padding: 20px; gap: 16px; }
-    .screen.active { display: flex; }
+    .topics-grid { display:flex; flex-wrap:wrap; gap:8px; }
+    .topic-chip { padding:7px 14px; border-radius:20px; font-size:13px; font-weight:500; border:0.5px solid var(--border2); background:var(--surface); color:var(--text2); cursor:pointer; transition:all 0.15s; user-select:none; }
+    .topic-chip.sel { background:var(--teal-l); border-color:var(--teal-m); color:var(--teal-d); }
 
-    .greeting { font-size: 22px; font-weight: 700; color: var(--text); letter-spacing: -0.02em; }
-    .field-label { font-size: 13px; color: var(--text2); margin-bottom: 5px; }
+    .my-tags { display:flex; flex-wrap:wrap; gap:6px; }
+    .my-tag { font-size:12px; padding:5px 12px; border-radius:20px; background:var(--teal-l); color:var(--teal-d); border:0.5px solid var(--teal-m); }
 
-    input[type="text"] {
-      width: 100%; padding: 11px 14px;
-      border: 0.5px solid var(--border2); border-radius: var(--r);
-      font-size: 15px; background: var(--surface); color: var(--text);
-      font-family: inherit; outline: none;
-    }
-    input[type="text"]:focus { border-color: var(--teal); box-shadow: 0 0 0 3px rgba(29,158,117,0.15); }
+    .wait-card { background:var(--surface); border:0.5px solid var(--border); border-radius:var(--rl); padding:28px 20px; display:flex; flex-direction:column; align-items:center; gap:16px; }
+    .wait-hint { font-size:13px; color:var(--text2); text-align:center; min-height:20px; line-height:1.5; }
+    .wait-hint.searching { color:var(--teal); }
+    .wait-hint.found     { color:var(--blue); font-weight:600; }
 
-    .topics-grid { display: flex; flex-wrap: wrap; gap: 8px; }
-    .topic-chip {
-      padding: 7px 14px; border-radius: 20px;
-      font-size: 13px; font-weight: 500;
-      border: 0.5px solid var(--border2); background: var(--surface);
-      color: var(--text2); cursor: pointer; transition: all 0.15s; user-select: none;
-    }
-    .topic-chip:hover { border-color: var(--teal-m); }
-    .topic-chip.sel { background: var(--teal-l); border-color: var(--teal-m); color: var(--teal-d); }
+    @keyframes pulse { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(1.06);opacity:.85} }
+    .big-btn { width:110px; height:110px; border-radius:50%; background:var(--teal); border:none; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:5px; cursor:pointer; outline:14px solid var(--teal-l); transition:transform 0.15s; }
+    .big-btn:hover { transform:scale(1.04); }
+    .big-btn.searching { animation:pulse 1.8s ease-in-out infinite; }
+    .big-btn i { font-size:30px; color:#fff; }
+    .big-btn span { font-size:11px; color:#fff; font-weight:600; }
+    #btn-stop-waiting { width:110px; height:110px; border-radius:50%; background:#888780; border:none; display:none; flex-direction:column; align-items:center; justify-content:center; gap:5px; cursor:pointer; outline:14px solid #F1EFE8; }
+    #btn-stop-waiting i,#btn-stop-waiting span { color:#fff; }
+    #btn-stop-waiting i { font-size:26px; }
+    #btn-stop-waiting span { font-size:11px; font-weight:600; }
 
-    .my-tags { display: flex; flex-wrap: wrap; gap: 6px; }
-    .my-tag { font-size: 12px; padding: 5px 12px; border-radius: 20px;
-              background: var(--teal-l); color: var(--teal-d); border: 0.5px solid var(--teal-m); }
+    .how-card { background:var(--surface); border:0.5px solid var(--border); border-radius:var(--rl); padding:14px 16px; }
+    .how-title { font-size:11px; font-weight:700; color:var(--text2); text-transform:uppercase; letter-spacing:0.07em; margin-bottom:8px; }
+    .how-body { font-size:13px; color:var(--text2); line-height:1.8; }
 
-    /* ── Wachtstand ── */
-    .wait-card {
-      background: var(--surface); border: 0.5px solid var(--border);
-      border-radius: var(--rl); padding: 28px 20px;
-      display: flex; flex-direction: column; align-items: center; gap: 16px;
-    }
-    .wait-hint { font-size: 13px; color: var(--text2); text-align: center; transition: color 0.3s; min-height: 20px; }
-    .wait-hint.searching { color: var(--teal); }
-    .wait-hint.found     { color: #185FA5; font-weight: 600; }
+    .match-header { display:flex; flex-direction:column; align-items:center; gap:8px; padding:8px 0; }
+    .match-avatars { display:flex; }
+    .av { width:56px; height:56px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-size:16px; font-weight:700; border:3px solid var(--surface); }
+    .av.you  { background:var(--teal-l); color:var(--teal-d); }
+    .av.them { background:var(--blue-l); color:var(--blue); margin-left:-12px; }
+    .match-title { font-size:22px; font-weight:700; color:var(--text); }
+    .match-sub   { font-size:14px; color:var(--text2); text-align:center; }
+    .distance-pill { padding:5px 14px; background:var(--teal-l); border-radius:20px; font-size:12px; font-weight:600; color:var(--teal-d); border:0.5px solid var(--teal-m); }
 
-    /* Pulserend BLE-icoon tijdens scannen */
-    @keyframes pulse { 0%,100%{ transform: scale(1); opacity:1; } 50%{ transform: scale(1.06); opacity:.85; } }
-    .big-btn {
-      width: 110px; height: 110px; border-radius: 50%;
-      background: var(--teal); border: none;
-      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
-      cursor: pointer; outline: 14px solid var(--teal-l);
-      transition: transform 0.15s, background 0.2s, outline-color 0.2s;
-    }
-    .big-btn:hover { transform: scale(1.04); }
-    .big-btn:active { transform: scale(0.97); }
-    .big-btn.searching { animation: pulse 1.8s ease-in-out infinite; }
-    .big-btn i { font-size: 30px; color: #fff; }
-    .big-btn span { font-size: 11px; color: #fff; font-weight: 600; }
+    .topic-card { background:var(--teal-l); border:0.5px solid var(--teal-m); border-radius:var(--rl); padding:16px 18px; }
+    .topic-label { font-size:10px; font-weight:700; color:var(--teal-d); text-transform:uppercase; letter-spacing:0.07em; margin-bottom:5px; }
+    .topic-val   { font-size:18px; font-weight:700; color:var(--teal-dd); }
+    .topic-start { font-size:13px; color:var(--teal-d); margin-top:8px; font-style:italic; }
+    .match-actions { display:flex; gap:10px; }
 
-    .btn-stop {
-      width: 110px; height: 110px; border-radius: 50%;
-      background: #888780; border: none;
-      display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
-      cursor: pointer; outline: 14px solid #F1EFE8;
-      transition: transform 0.15s; display: none;
-    }
-    .btn-stop:hover { transform: scale(1.04); }
-    .btn-stop i { font-size: 26px; color: #fff; }
-    .btn-stop span { font-size: 11px; color: #fff; font-weight: 600; }
+    .connect-center { display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px 0; text-align:center; }
+    .connect-emoji  { font-size:52px; line-height:1; }
+    .connect-title  { font-size:22px; font-weight:700; color:var(--text); }
+    .connect-sub    { font-size:14px; color:var(--text2); line-height:1.6; }
+    .connect-hint   { font-size:12px; color:var(--text3); font-style:italic; line-height:1.6; }
+    .opener-card    { width:100%; background:var(--surface2); border-radius:var(--rl); border:0.5px solid var(--border); padding:16px 18px; text-align:center; }
+    .opener-label   { font-size:10px; font-weight:700; color:var(--text2); text-transform:uppercase; letter-spacing:0.07em; margin-bottom:6px; }
+    .opener-val     { font-size:15px; font-weight:500; color:var(--text); }
 
-    /* BLE debug log */
-    #ble-log {
-      font-size: 11px; color: var(--text3); text-align: center;
-      font-family: monospace; line-height: 1.7; min-height: 16px;
-    }
+    .btn { width:100%; padding:14px; border-radius:var(--r); font-size:15px; font-weight:600; cursor:pointer; font-family:inherit; transition:opacity 0.15s,transform 0.1s; border:none; }
+    .btn:active { transform:scale(0.98); }
+    .btn-primary   { background:var(--teal); color:#fff; }
+    .btn-primary:hover { opacity:.88; }
+    .btn-secondary { background:var(--surface2); color:var(--text2); border:0.5px solid var(--border2) !important; }
 
-    /* ── Match ── */
-    .match-header { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 8px 0; }
-    .match-avatars { display: flex; }
-    .av {
-      width: 56px; height: 56px; border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 16px; font-weight: 700; border: 3px solid var(--surface);
-    }
-    .av.you  { background: var(--teal-l); color: var(--teal-d); }
-    .av.them { background: var(--blue-l); color: var(--blue); margin-left: -12px; }
-    .match-title { font-size: 22px; font-weight: 700; color: var(--text); }
-    .match-sub   { font-size: 14px; color: var(--text2); text-align: center; }
-    .topic-card  { background: var(--teal-l); border: 0.5px solid var(--teal-m); border-radius: var(--rl); padding: 16px 18px; }
-    .topic-label { font-size: 10px; font-weight: 700; color: var(--teal-d); text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 5px; }
-    .topic-val   { font-size: 18px; font-weight: 700; color: var(--teal-dd); }
-    .topic-start { font-size: 13px; color: var(--teal-d); margin-top: 8px; font-style: italic; }
-    .match-actions { display: flex; gap: 10px; margin-top: 4px; }
-
-    /* ── Connect ── */
-    .connect-center { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px 0; text-align: center; }
-    .connect-emoji  { font-size: 52px; line-height: 1; }
-    .connect-title  { font-size: 22px; font-weight: 700; color: var(--text); }
-    .connect-sub    { font-size: 14px; color: var(--text2); line-height: 1.6; }
-    .connect-hint   { font-size: 12px; color: var(--text3); font-style: italic; line-height: 1.6; }
-
-    /* ── Knoppen ── */
-    .btn { width: 100%; padding: 14px; border-radius: var(--r); font-size: 15px; font-weight: 600; cursor: pointer; font-family: inherit; transition: opacity 0.15s, transform 0.1s; border: none; }
-    .btn:active { transform: scale(0.98); }
-    .btn-primary   { background: var(--teal); color: #fff; }
-    .btn-primary:hover { opacity: 0.88; }
-    .btn-secondary { background: var(--surface2); color: var(--text2); border: 0.5px solid var(--border2) !important; }
-    .btn-secondary:hover { background: var(--border); }
-
-    /* ── Toast ── */
-    #error-toast {
-      position: fixed; bottom: 24px; left: 50%;
-      transform: translateX(-50%) translateY(80px);
-      background: #A32D2D; color: #fff;
-      padding: 10px 20px; border-radius: 20px;
-      font-size: 13px; font-weight: 500;
-      transition: transform 0.3s; z-index: 100; white-space: nowrap;
-    }
-    #error-toast.visible { transform: translateX(-50%) translateY(0); }
+    #error-toast { position:fixed; bottom:24px; left:50%; transform:translateX(-50%) translateY(80px); background:#A32D2D; color:#fff; padding:10px 20px; border-radius:20px; font-size:13px; font-weight:500; transition:transform 0.3s; z-index:100; white-space:nowrap; max-width:90vw; text-align:center; }
+    #error-toast.visible { transform:translateX(-50%) translateY(0); }
   </style>
 </head>
 <body>
@@ -528,16 +431,10 @@
   <div class="app-bar">
     <div class="logo"><i class="ti ti-messages"></i></div>
     <span class="app-title">WaitTalk</span>
-    <div class="app-bar-actions">
-      <button class="icon-btn" id="btn-edit-profile" title="Profiel bewerken">
-        <i class="ti ti-user"></i>
-      </button>
-    </div>
+    <button class="icon-btn" id="btn-edit-profile" title="Profiel bewerken"><i class="ti ti-user"></i></button>
   </div>
 
-  <div id="bt-warning"></div>
-
-  <!-- SCHERM: Profiel -->
+  <!-- PROFIEL -->
   <div class="screen" id="screen-profile">
     <div class="greeting">Hoi, ik ben...</div>
     <p style="font-size:14px;color:var(--text2)">Vertel wat je leuk vindt. We koppelen je aan iemand dichtbij.</p>
@@ -565,38 +462,33 @@
     <button class="btn btn-primary" id="btn-save-profile">Opslaan en doorgaan</button>
   </div>
 
-  <!-- SCHERM: Home / Wachtstand -->
+  <!-- HOME / WACHTSTAND -->
   <div class="screen" id="screen-home">
     <div id="home-greeting" class="greeting">Hoi!</div>
     <div class="my-tags" id="home-tags"></div>
-
     <div class="wait-card">
       <div class="wait-hint" id="wait-status">Tik om te starten</div>
-
       <button class="big-btn" id="btn-start-waiting">
-        <i class="ti ti-bluetooth"></i>
+        <i class="ti ti-map-pin"></i>
         <span>Ik wacht</span>
       </button>
-      <button class="btn-stop" id="btn-stop-waiting">
+      <button id="btn-stop-waiting">
         <i class="ti ti-x"></i>
         <span>Stop</span>
       </button>
-
-      <div id="ble-log"></div>
     </div>
-
-    <div style="background:var(--surface);border:0.5px solid var(--border);border-radius:var(--rl);padding:14px 16px;">
-      <div style="font-size:11px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.07em;margin-bottom:8px;">Hoe werkt het?</div>
-      <div style="font-size:13px;color:var(--text2);line-height:1.7;">
+    <div class="how-card">
+      <div class="how-title">Hoe werkt het?</div>
+      <div class="how-body">
         1. Tik op de knop als je aan het wachten bent<br>
-        2. Je telefoon zoekt via Bluetooth naar anderen<br>
-        3. Bij een match krijg je een melding + trilling<br>
+        2. De app deelt je locatie anoniem (alleen afstand)<br>
+        3. Bij iemand met dezelfde interesses binnen 50m → match!<br>
         4. Loop naar elkaar toe en zeg hallo 👋
       </div>
     </div>
   </div>
 
-  <!-- SCHERM: Match gevonden -->
+  <!-- MATCH GEVONDEN -->
   <div class="screen" id="screen-match">
     <div class="match-header">
       <div class="match-avatars">
@@ -604,6 +496,7 @@
         <div class="av them" id="av-them">??</div>
       </div>
       <div class="match-title">Match gevonden!</div>
+      <div class="distance-pill" id="match-distance">dichtbij</div>
       <div class="match-sub"><strong id="match-name">Iemand</strong> wil ook praten</div>
     </div>
     <div class="topic-card">
@@ -617,20 +510,18 @@
     </div>
   </div>
 
-  <!-- SCHERM: Verbonden -->
+  <!-- VERBONDEN -->
   <div class="screen" id="screen-connect">
     <div class="connect-center">
       <div class="connect-emoji">👋</div>
       <div class="connect-title">Jullie zijn verbonden!</div>
-      <div style="padding:5px 14px;background:var(--teal-l);border-radius:20px;font-size:13px;font-weight:600;color:var(--teal-d);border:0.5px solid var(--teal-m)">
-        Loop naar <span id="connect-name">elkaar</span> toe
+      <div class="distance-pill" id="connect-distance">dichtbij</div>
+      <div class="connect-sub">Loop naar <strong id="connect-name">elkaar</strong> toe en zeg gewoon hallo. De app doet de rest niet — dat doe jij.</div>
+      <div class="opener-card">
+        <div class="opener-label">Gespreksopener over <span id="connect-topic">—</span></div>
+        <div class="opener-val" id="connect-starter">—</div>
       </div>
-      <div class="connect-sub">Zeg gewoon hallo. De app doet de rest niet — dat doe jij.</div>
-      <div style="width:100%;background:var(--surface2);border-radius:var(--rl);border:0.5px solid var(--border);padding:16px 18px;text-align:center">
-        <div style="font-size:10px;font-weight:700;color:var(--text2);text-transform:uppercase;letter-spacing:0.07em;margin-bottom:6px">Gespreksopener over <span id="connect-topic">—</span></div>
-        <div style="font-size:15px;font-weight:500;color:var(--text)" id="connect-starter">—</div>
-      </div>
-      <div class="connect-hint">Na het gesprek? Geen verdere koppeling, geen social media. Gewoon een goed praatje.</div>
+      <div class="connect-hint">Geen verdere koppeling, geen social media. Gewoon een goed praatje.</div>
     </div>
     <button class="btn btn-secondary" id="btn-done">Klaar — terug naar begin</button>
   </div>
@@ -639,8 +530,7 @@
 
   <script>
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js")
-        .then(() => console.log("SW actief"))
+      navigator.serviceWorker.register("./sw.js")
         .catch(e => console.warn("SW:", e));
     }
   </script>
