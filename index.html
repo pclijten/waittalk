@@ -30,13 +30,14 @@
     //    → Nieuw project → Voeg web-app toe → Kopieer config hier
     // ─────────────────────────────────────────────────────────
     const firebaseConfig = {
-      apiKey:            "JOUW_API_KEY",
-      authDomain:        "JOUW_PROJECT.firebaseapp.com",
-      databaseURL:       "https://JOUW_PROJECT-default-rtdb.europe-west1.firebasedatabase.app",
-      projectId:         "JOUW_PROJECT",
-      storageBucket:     "JOUW_PROJECT.appspot.com",
-      messagingSenderId: "JOUW_SENDER_ID",
-      appId:             "JOUW_APP_ID"
+      apiKey:            "AIzaSyC8lm0aBDSUgSaJmTWgkr4GdgGaog70mbA",
+      authDomain:        "waittalk.firebaseapp.com",
+      databaseURL:       "https://waittalk-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId:         "waittalk",
+      storageBucket:     "waittalk.firebasestorage.app",
+      messagingSenderId: "559058014544",
+      appId:             "1:559058014544:web:f7a8198be2e3a7d4b31c55",
+      measurementId:     "G-K0J3C2PNTL"
     };
 
     const app  = initializeApp(firebaseConfig);
@@ -629,5 +630,12 @@
   <!-- Toast voor foutmeldingen -->
   <div id="error-toast"></div>
 
+  <script>
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("/sw.js")
+        .then(() => console.log("Service Worker actief"))
+        .catch(err => console.warn("SW mislukt:", err));
+    }
+  </script>
 </body>
 </html>
