@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WaitTalk – Bluetooth test</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@2.44.0/tabler-icons.min.css" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, sans-serif; background: #f5f4f0; padding: 24px 20px; color: #1a1a18; }
+    h1   { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+    p    { font-size: 13px; color: #6b6a65; margin-bottom: 20px; line-height: 1.5; }
+
+    .card { background: #fff; border: 0.5px solid rgba(0,0,0,0.12); border-radius: 14px; padding: 18px; margin-bottom: 14px; }
+    .card-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: #6b6a65; margin-bottom: 10px; }
+
+    .status { font-size: 13px; padding: 8px 12px; border-radius: 8px; margin-bottom: 10px; line-height: 1.5; }
+    .status.ok   { background: #E1F5EE; color: #0F6E56; }
+    .status.warn { background: #FAEEDA; color: #633806; }
+    .status.err  { background: #FCEBEB; color: #791F1F; }
+    .status.info { background: #E6F1FB; color: #0C447C; }
+
+    .btn {
+      display: block; width: 100%; padding: 13px;
+      background: #1D9E75; color: #fff; border: none;
+      border-radius: 8px; font-size: 14px; font-weight: 600;
+      cursor: pointer; font-family: inherit; margin-bottom: 10px;
+      transition: opacity 0.15s;
+    }
+    .btn:hover   { opacity: 0.88; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn.secondary { background: #f0efeb; color: #6b6a65; border: 0.5px solid rgba(0,0,0,0.2); }
+
+    #log {
+      font-family: monospace; font-size: 11px; color: #6b6a65;
+      line-height: 1.8; max-height: 180px; overflow-y: auto;
+      background: #f5f4f0; border-radius: 8px; padding: 10px;
+    }
+    .log-ok   { color: #0F6E56; }
+    .log-err  { color: #A32D2D; }
+    .log-info { color: #185FA5; }
+  </style>
+</head>
+<body>
+
+  <h1>Bluetooth test</h1>
+  <p>Gebruik deze pagina om te controleren of Bluetooth werkt op beide telefoons voordat je de echte app test.</p>
+
+  <!-- Stap 1: Check -->
+  <div class="card">
+    <div class="card-title">Stap 1 — Browser & Bluetooth check</div>
+    <div id="status-browser" class="status info">Controleren...</div>
+    <div id="status-bt"      class="status info">Bluetooth status ophalen...</div>
+  </div>
+
+  <!-- Stap 2: Scannen -->
+  <div class="card">
+    <div class="card-title">Stap 2 — Scan naar WaitTalk-apparaten</div>
+    <p style="margin-bottom:12px">Zorg dat op de ANDERE telefoon de echte WaitTalk app open staat en actief is. Druk dan hier op Scannen.</p>
+    <button class="btn" id="btn-scan" onclick="startScan()">
+      <i class="ti ti-bluetooth"></i> Scannen starten
+    </button>
+    <div id="status-scan" class="status info" style="display:none"></div>
+    <div id="device-result" style="display:none;margin-top:10px;padding:12px;background:#E1F5EE;border-radius:8px;border:0.5px solid #5DCAA5">
+      <div style="font-size:11px;font-weight:700;color:#0F6E56;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:4px">Apparaat gevonden</div>
+      <div style="font-size:15px;font-weight:600;color:#085041" id="device-name">—</div>
+      <div style="font-size:12px;color:#0F6E56;margin-top:2px" id="device-uid">—</div>
+    </div>
+  </div>
+
+  <!-- Log -->
+  <div class="card">
+    <div class="card-title">Debug log</div>
+    <div id="log">Wachten op actie...\n</div>
+  </div>
+
+  <button class="btn secondary" onclick="document.getElementById('log').innerHTML='Leeg gemaakt.\n'">Log wissen</button>
+
+  <script>
+    const WT_SERVICE_UUID = "0000181c-0000-1000-8000-00805f9b34fb";
+    const WT_CHAR_UUID    = "00002a19-0000-1000-8000-00805f9b34fb";
+
+    function log(msg, cls = "") {
+      const el = document.getElementById("log");
+      const line = document.createElement("div");
+      if (cls) line.className = "log-" + cls;
+      line.textContent = new Date().toLocaleTimeString("nl") + "  " + msg;
+      el.appendChild(line);
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function setStatus(id, msg, cls) {
+      const el = document.getElementById(id);
+      el.textContent = msg;
+      el.className   = "status " + cls;
+    }
+
+    // ── Stap 1: checks ──
+    (async () => {
+      // Browser check
+      const isChrome = /Chrome/.test(navigator.userAgent) && !/Chromium/.test(navigator.userAgent);
+      const isAndroid = /Android/.test(navigator.userAgent);
+
+      if (!navigator.bluetooth) {
+        setStatus("status-browser", "❌ Web Bluetooth niet beschikbaar. Gebruik Chrome op Android.", "err");
+        document.getElementById("btn-scan").disabled = true;
+        log("Web Bluetooth API niet gevonden", "err");
+        return;
+      }
+      if (!isAndroid) {
+        setStatus("status-browser", "⚠️ Niet op Android. Web Bluetooth werkt het best op Android Chrome.", "warn");
+        log("Niet op Android gedetecteerd — kan problemen geven", "err");
+      } else if (isChrome) {
+        setStatus("status-browser", "✅ Android Chrome — perfect voor Web Bluetooth.", "ok");
+        log("Browser OK: Android Chrome", "ok");
+      } else {
+        setStatus("status-browser", "⚠️ Android maar niet Chrome. Probeer Chrome voor beste resultaat.", "warn");
+      }
+
+      // Bluetooth beschikbaarheid
+      try {
+        const available = await navigator.bluetooth.getAvailability();
+        if (available) {
+          setStatus("status-bt", "✅ Bluetooth is beschikbaar en ingeschakeld.", "ok");
+          log("Bluetooth beschikbaar: ja", "ok");
+        } else {
+          setStatus("status-bt", "❌ Bluetooth staat uit. Zet het aan in instellingen.", "err");
+          log("Bluetooth beschikbaar: nee", "err");
+          document.getElementById("btn-scan").disabled = true;
+        }
+      } catch(e) {
+        setStatus("status-bt", "⚠️ Bluetooth status onbekend. Probeer toch te scannen.", "warn");
+        log("Bluetooth availability check mislukt: " + e.message, "err");
+      }
+    })();
+
+    // ── Stap 2: scannen ──
+    async function startScan() {
+      const scanStatus = document.getElementById("status-scan");
+      scanStatus.style.display = "block";
+      setStatus("status-scan", "Bluetooth picker opent... kies een WaitTalk-apparaat.", "info");
+      log("Scan gestart — picker opent");
+
+      try {
+        const device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [WT_SERVICE_UUID] }],
+          optionalServices: [WT_SERVICE_UUID]
+        });
+
+        log("Apparaat gekozen: " + device.name, "ok");
+        setStatus("status-scan", "Verbinding maken met " + device.name + "...", "info");
+
+        const server  = await device.gatt.connect();
+        log("GATT verbonden", "ok");
+
+        const service = await server.getPrimaryService(WT_SERVICE_UUID);
+        log("Service gevonden: " + WT_SERVICE_UUID, "ok");
+
+        const char    = await service.getCharacteristic(WT_CHAR_UUID);
+        const value   = await char.readValue();
+        const uid     = new TextDecoder().decode(value).trim();
+        log("UID uitgelezen: " + uid, "ok");
+
+        device.gatt.disconnect();
+        log("Verbinding gesloten", "info");
+
+        // Resultaat tonen
+        document.getElementById("device-result").style.display = "block";
+        document.getElementById("device-name").textContent = device.name || "(geen naam)";
+        document.getElementById("device-uid").textContent  = "UID: " + uid;
+        setStatus("status-scan", "✅ Gelukt! Bluetooth nabijheidsdetectie werkt correct.", "ok");
+
+      } catch(err) {
+        log("Fout: [" + err.name + "] " + err.message, "err");
+        if (err.name === "NotFoundError") {
+          setStatus("status-scan", "Geen WaitTalk-apparaat gevonden. Is de andere app actief?", "warn");
+        } else if (err.name === "NotAllowedError") {
+          setStatus("status-scan", "Toestemming geweigerd. Sta Bluetooth toe in Chrome.", "err");
+        } else if (err.name === "NetworkError") {
+          setStatus("status-scan", "Verbinding mislukt. Zorg dat beide telefoons dichtbij zijn.", "err");
+        } else {
+          setStatus("status-scan", "Fout: " + err.message, "err");
+        }
+      }
+    }
+  </script>
+
+</body>
+</html>
